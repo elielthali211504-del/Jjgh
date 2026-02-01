@@ -50,7 +50,7 @@ PRE_CONFIGURATED_USERS = {
         "proxy": "",
         "tokenize": 0
     },
-    "yordante,alejandrorosell,maykolguille,Satoru_2115,Carlosx200,RancesCuit,SchnauzerMinnie,DARKBRAI": {
+    "yordante,alejandrorosell,maykolguille,Satoru_2115,Carlosx200,RancesCuit,SchnauzerMinnie,DARKBRAI,Iamv66": {
         "cloudtype": "moodle",
         "moodle_host": "https://cursos.uo.edu.cu/",
         "moodle_repo_id": 4,
@@ -2231,6 +2231,7 @@ if __name__ == '__main__':
         main()
     except:
         main()
+
 
 
 
