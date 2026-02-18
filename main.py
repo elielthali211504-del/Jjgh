@@ -63,9 +63,9 @@ PRE_CONFIGURATED_USERS = {
     },
     "gatitoo_miauu,yordante,alejandrorosell,maykolguille,RancesCuit,SchnauzerMinnie,DARKBRAI,Iamv66,THE4L3X_08": {
         "cloudtype": "moodle",
-        "moodle_host": "https://cursosonline.etecsa.cu/",
-        "moodle_repo_id": 4,
-        "moodle_user": "eliel2222",
+        "moodle_host": "https://caipd.ucf.edu.cu/",
+        "moodle_repo_id": 5,
+        "moodle_user": "eliel21",
         "moodle_password": "ElielThali2115.",
         "zips": 99,
         "uploadtype": "evidence",
@@ -2231,6 +2231,7 @@ if __name__ == '__main__':
         main()
     except:
         main()
+
 
 
 
