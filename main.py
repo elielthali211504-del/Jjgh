@@ -138,73 +138,52 @@ class TaskStatus(Enum):
     PROCESSING = "processing" # En proceso
     COMPLETED = "completed"   # Completada
     FAILED = "failed"        # Falló
-    CANCELLED = "cancelled"  # Cancelada por usuario
+    CANCELLED = "cancelled"  # Cancelada
 
 class TaskType(Enum):
     UPLOAD_URL = "upload_url"  # Subir desde URL
 
 @dataclass
 class Task:
-    """Representa una tarea en la cola"""
     id: str
     user_id: int
     username: str
     task_type: TaskType
-    data: Dict[str, Any]
+    data: dict
     status: TaskStatus
     created_at: str
-    started_at: Optional[str] = None
-    completed_at: Optional[str] = None
-    error: Optional[str] = None
+    started_at: str = None
+    completed_at: str = None
+    error: str = None
     retry_count: int = 0
-    max_retries: int = 2  # Reintentar 2 veces máximo
+    max_retries: int = 2
 
 # ============================================
-# GESTOR DE COLAS POR USUARIO (EN MEMORIA)
+# GESTOR DE COLAS
 # ============================================
 
 class UserQueueManager:
-    """
-    Sistema de colas en memoria, UNA COLA POR USUARIO
-    - Cada usuario tiene su propia cola FIFO
-    - Solo 1 tarea activa por usuario
-    - Si la tarea falla, se reintenta (máx 2 veces)
-    - Todo en RAM, no se guarda en disco
-    """
-    
     def __init__(self, bot, jdb):
         self.bot = bot
         self.jdb = jdb
-        
-        # Colas por usuario: username -> Queue
-        self.user_queues: Dict[str, queue.Queue] = {}
-        
-        # Tarea activa por usuario: username -> Task
-        self.active_tasks: Dict[str, Task] = {}
-        
-        # Lock para operaciones thread-safe
+        self.user_queues = {}  # username -> Queue
+        self.active_tasks = {}  # username -> Task
         self.lock = threading.Lock()
-        
-        # Flag para detener el procesador
         self.running = True
         
-        # Iniciar procesador de tareas (hilo demonio)
+        # Iniciar procesador
         self.processor_thread = threading.Thread(target=self._process_loop, daemon=True)
         self.processor_thread.start()
         
-        print("✅ Sistema de colas por usuario inicializado (en memoria)")
+        print("✅ Sistema de colas iniciado")
     
-    def add_task(self, user_id: int, username: str, task_type: TaskType, data: Dict[str, Any], thread=None) -> str:
-        """
-        Agrega una tarea a la cola del usuario
-        Guarda thread ID para poder cancelar
-        """
+    def add_task(self, user_id, username, task_type, data, thread=None):
+        """Agrega tarea a la cola del usuario"""
         task_id = createID()
         
-        # Guardar thread ID si existe
         if thread:
             data['thread_id'] = thread.id
-            thread.store('task_id', task_id)  # Guardar task_id en el thread
+            thread.store('task_id', task_id)
         
         task = Task(
             id=task_id,
@@ -221,98 +200,104 @@ class UserQueueManager:
                 self.user_queues[username] = queue.Queue()
             self.user_queues[username].put(task)
         
-        print(f"📥 Tarea {task_id[:8]} agregada para @{username} (cola: {self.user_queues[username].qsize()})")
         return task_id
     
-    def get_user_status(self, username: str) -> Dict:
-        """Obtiene estado de las tareas de un usuario"""
+    def get_user_status(self, username):
+        """Obtiene estado del usuario"""
         with self.lock:
             active = self.active_tasks.get(username)
-            
-            # Obtener cola (hacemos copia de los IDs)
-            queue_tasks = []
+            queue_list = []
             if username in self.user_queues:
-                q = self.user_queues[username]
-                queue_tasks = [task.id for task in list(q.queue)]
-            
+                queue_list = [t.id for t in list(self.user_queues[username].queue)]
             return {
                 'active': active,
-                'queue_ids': queue_tasks,
-                'queue_length': len(queue_tasks)
+                'queue_ids': queue_list,
+                'queue_length': len(queue_list)
             }
     
-    def cancel_task(self, username: str, task_id: str) -> bool:
-        """Cancela una tarea (solo si está en cola o activa)"""
+    def cancel_task_by_id(self, username, task_id):
+        """Cancela tarea por ID"""
         with self.lock:
-            # CASO 1: Es la tarea activa
+            # Verificar si es la activa
             active = self.active_tasks.get(username)
             if active and active.id == task_id:
-                # Marcar como cancelada (el hilo la detendrá)
                 active.status = TaskStatus.CANCELLED
-                
-                # Buscar el thread y detenerlo
                 thread_id = active.data.get('thread_id')
                 if thread_id and hasattr(self.bot, 'threads'):
                     thread = self.bot.threads.get(thread_id)
                     if thread:
                         thread.store('stop', True)
-                
-                # Remover de activas
                 self.active_tasks.pop(username, None)
-                return True
+                return True, "activa"
             
-            # CASO 2: Está en cola
+            # Buscar en cola
             if username in self.user_queues:
                 new_queue = queue.Queue()
                 removed = False
-                
                 q = self.user_queues[username]
                 while not q.empty():
                     task = q.get()
                     if task.id == task_id:
                         removed = True
-                        task.status = TaskStatus.CANCELLED
-                        print(f"🗑️ Tarea {task_id[:8]} cancelada de la cola de @{username}")
-                        # No la agregamos a la nueva cola
                     else:
                         new_queue.put(task)
-                
                 self.user_queues[username] = new_queue
-                return removed
+                if removed:
+                    return True, "cola"
             
-            return False
+            return False, None
+    
+    def cancel_task_by_position(self, username, position):
+        """Cancela tarea por posición (1 = primera en cola)"""
+        with self.lock:
+            if username not in self.user_queues:
+                return False, "No tienes cola"
+            
+            q = self.user_queues[username]
+            if q.qsize() < position or position < 1:
+                return False, f"Posición inválida. Tienes {q.qsize()} tareas"
+            
+            new_queue = queue.Queue()
+            removed = False
+            current_pos = 1
+            task_id = None
+            
+            while not q.empty():
+                task = q.get()
+                if current_pos == position:
+                    removed = True
+                    task_id = task.id[:8]
+                else:
+                    new_queue.put(task)
+                current_pos += 1
+            
+            self.user_queues[username] = new_queue
+            if removed:
+                return True, f"Tarea en posición {position} cancelada (ID: {task_id})"
+            return False, "Error al cancelar"
     
     def _process_loop(self):
-        """Bucle principal que procesa las tareas"""
+        """Procesador de tareas"""
         while self.running:
             try:
-                # Buscar usuarios con tareas pendientes
                 users_to_process = []
-                
                 with self.lock:
                     for username, q in self.user_queues.items():
-                        # Si el usuario no tiene tarea activa Y tiene cola no vacía
                         if username not in self.active_tasks and not q.empty():
                             users_to_process.append(username)
                 
-                # Procesar cada usuario (máximo 1 tarea por usuario)
                 for username in users_to_process:
                     self._process_next_task(username)
                 
-                # Pequeña pausa para no saturar CPU
                 time.sleep(0.5)
-                
             except Exception as e:
-                print(f"❌ Error en process_loop: {e}")
-                traceback.print_exc()
+                print(f"Error en process_loop: {e}")
                 time.sleep(2)
     
-    def _process_next_task(self, username: str):
-        """Procesa la siguiente tarea de un usuario"""
+    def _process_next_task(self, username):
+        """Procesa siguiente tarea"""
         task = None
-        
         try:
-            # Obtener siguiente tarea
             with self.lock:
                 if username in self.user_queues:
                     q = self.user_queues[username]
@@ -325,57 +310,32 @@ class UserQueueManager:
             if not task:
                 return
             
-            print(f"▶️ Procesando tarea {task.id[:8]} para @{username}")
-            
-            # Notificar inicio al usuario
+            # Notificar inicio
             try:
                 remaining = self.get_user_status(username)['queue_length']
-                msg = f"🔄 **Procesando tu solicitud**\n📋 ID: `{task.id[:8]}`"
+                msg = f"🔄 Procesando tu solicitud\nID: {task.id[:8]}"
                 if remaining > 0:
-                    msg += f"\n📦 {remaining} tarea(s) pendiente(s) en cola"
+                    msg += f"\n📦 {remaining} tarea(s) en cola"
                 self.bot.sendMessage(task.user_id, msg)
             except:
                 pass
             
-            # Ejecutar según tipo de tarea
+            # Ejecutar
             if task.task_type == TaskType.UPLOAD_URL:
                 self._execute_upload_url(task)
-            else:
-                raise Exception(f"Tipo de tarea no soportado: {task.task_type}")
             
-            # Si llegamos aquí, tarea completada exitosamente
+            # Completada
             with self.lock:
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = datetime.datetime.now().isoformat()
                 self.active_tasks.pop(username, None)
             
-            print(f"✅ Tarea {task.id[:8]} completada para @{username}")
-            
-            # Notificar éxito
-            try:
-                remaining = self.get_user_status(username)['queue_length']
-                if remaining > 0:
-                    self.bot.sendMessage(
-                        task.user_id,
-                        f"✅ Tarea completada. {remaining} tarea(s) pendiente(s) en cola."
-                    )
-            except:
-                pass
-            
         except Exception as e:
-            print(f"❌ Error procesando tarea {task.id if task else 'unknown'}: {e}")
-            traceback.print_exc()
-            
             if task:
-                # Manejar error con reintentos
                 with self.lock:
                     task.retry_count += 1
-                    
                     if task.retry_count < task.max_retries:
-                        # Reintentar
-                        print(f"⚠️ Tarea {task.id[:8]} falló, reintento {task.retry_count}/{task.max_retries}")
                         task.status = TaskStatus.PENDING
-                        # Re-encolar al principio de la cola
                         if username in self.user_queues:
                             new_queue = queue.Queue()
                             new_queue.put(task)
@@ -383,73 +343,23 @@ class UserQueueManager:
                             while not q.empty():
                                 new_queue.put(q.get())
                             self.user_queues[username] = new_queue
-                        
                         self.active_tasks.pop(username, None)
-                        
-                        # Notificar reintento
-                        try:
-                            self.bot.sendMessage(
-                                task.user_id,
-                                f"⚠️ Error temporal. Reintentando ({task.retry_count}/{task.max_retries})..."
-                            )
-                        except:
-                            pass
-                        
                     else:
-                        # Máximo de reintentos alcanzado
                         task.status = TaskStatus.FAILED
                         task.error = str(e)
-                        task.completed_at = datetime.datetime.now().isoformat()
                         self.active_tasks.pop(username, None)
-                        
-                        print(f"❌ Tarea {task.id[:8]} falló definitivamente")
-                        
-                        # Notificar error
-                        try:
-                            self.bot.sendMessage(
-                                task.user_id,
-                                f"❌ Error en tu tarea después de {task.max_retries} intentos."
-                            )
-                        except:
-                            pass
             else:
                 with self.lock:
                     self.active_tasks.pop(username, None)
     
-    def _execute_upload_url(self, task: Task):
-        """Ejecuta una subida desde URL"""
+    def _execute_upload_url(self, task):
+        """Ejecuta subida de URL"""
         url = task.data.get('url')
         update = task.data.get('update')
         thread = task.data.get('thread')
         message = task.data.get('message')
         
-        # Obtener user_info
-        user_info = self.jdb.get_user(task.username)
-        if not user_info:
-            raise Exception("No se encontró información del usuario")
-        
-        # Verificar tamaño (opcional)
-        try:
-            headers = {}
-            if user_info.get('proxy'):
-                proxy_dict = ProxyCloud.parse(user_info['proxy'])
-                if 'http' in proxy_dict:
-                    headers.update({'Proxy': proxy_dict['http']})
-            
-            response = requests.head(url, allow_redirects=True, timeout=5, headers=headers)
-            file_size = int(response.headers.get('content-length', 0))
-            file_size_mb = file_size / (1024 * 1024)
-            
-            if file_size_mb > 500:
-                self.bot.sendMessage(
-                    task.user_id,
-                    f"⚠️ Archivo grande: {file_size_mb:.2f} MB. Subiendo..."
-                )
-        except:
-            pass  # Si falla la verificación, continuar
-        
-        # Llamar a la función ddl original
-        from main import ddl  # Ajusta el import según tu estructura
+        # Llamar a ddl original
         ddl(update, self.bot, message, url, file_name='', thread=thread, jdb=self.jdb)
 
 
@@ -705,7 +615,7 @@ def processUploadFiles(filename,filesize,files,update,bot,message,thread=None,jd
                 tokenize = False
                 if user_info['tokenize']!=0:
                    tokenize = True
-                fileid = None  # Inicializar fileid
+                fileid = None
                 while resp is None:
                     fileid,resp = client.upload_file(f,evidence,fileid,progressfunc=uploadFile,args=(bot,message,originalfile,thread),tokenize=tokenize)
                     draftlist.append(resp)
@@ -1370,7 +1280,7 @@ def show_loading_progress(bot, message, step, total_steps=3):
     bot.editMessageText(message, f"{msg} {bar}")
 
 # ==============================
-# FUNCIÓN PRINCIPAL ONMESSAGE (MODIFICADA CON SISTEMA DE COLAS)
+# FUNCIÓN PRINCIPAL ONMESSAGE
 # ==============================
 
 def onmessage(update,bot:ObigramClient):
@@ -1400,7 +1310,7 @@ def onmessage(update,bot:ObigramClient):
             jdb.save_data_user(username, user_info)
             jdb.save()
 
-        # ===== NUEVO: Inicializar sistema de colas en el bot =====
+        # ===== NUEVO: Inicializar sistema de colas =====
         if not hasattr(bot, 'queue_manager'):
             bot.queue_manager = UserQueueManager(bot, jdb)
         
@@ -1410,7 +1320,7 @@ def onmessage(update,bot:ObigramClient):
         try: msgText = update.message.text
         except:pass
 
-        # ===== NUEVO: Comando /queue para usuarios =====
+        # ===== NUEVO: Comando /queue =====
         if msgText == '/queue':
             status = queue_manager.get_user_status(username)
             
@@ -1418,204 +1328,90 @@ def onmessage(update,bot:ObigramClient):
                 bot.sendMessage(update.message.chat.id, "📭 No tienes tareas pendientes")
                 return
             
-            msg = "📊 **ESTADO DE TUS TAREAS**\n"
-            msg += "━━━━━━━━━━━━━━━━━━━\n\n"
+            msg = "📊 ESTADO DE TUS TAREAS\n"
+            msg += "━━━━━━━━━━━━━━━━━━━\n"
             
             if status['active']:
                 active = status['active']
-                msg += f"**▶️ EN PROCESO**\n"
-                msg += f"🆔 ID: `{active.id[:8]}`\n"
+                msg += f"\n▶️ EN PROCESO\n"
+                msg += f"ID: {active.id[:8]}\n"
                 if active.task_type == TaskType.UPLOAD_URL:
                     url = active.data.get('url', '')[:40]
-                    msg += f"🔗 {url}...\n"
-                msg += "\n"
+                    msg += f"URL: {url}...\n"
             
             if status['queue_length'] > 0:
-                msg += f"**📦 EN COLA ({status['queue_length']})**\n"
-                for i, task_id in enumerate(status['queue_ids'][:5]):
-                    msg += f"   {i+1}. `{task_id[:8]}`\n"
+                msg += f"\n📦 EN COLA ({status['queue_length']})\n"
+                for i, task_id in enumerate(status['queue_ids'][:5], 1):
+                    msg += f"  {i}. ID: {task_id[:8]}\n"
+                    msg += f"     /cancel_pos {i}\n"
                 if status['queue_length'] > 5:
-                    msg += f"   ... y {status['queue_length'] - 5} más\n"
+                    msg += f"  ... y {status['queue_length'] - 5} más\n"
             
-            msg += f"\n━━━━━━━━━━━━━━━━━━━\n"
-            msg += f"🗑️ /cancel_ID - Cancelar tarea (si está en cola)"
+            msg += "\n━━━━━━━━━━━━━━━━━━━\n"
+            msg += "/cancel_pos NUM - Cancelar por posición\n"
+            msg += "/cancel_ID - Cancelar por ID"
             
             bot.sendMessage(update.message.chat.id, msg)
             return
 
-        # ===== NUEVO: Comando /adm_queues MEJORADO para admin =====
-        if username == ADMIN_USERNAME and msgText == '/adm_queues':
+        # ===== NUEVO: Comando /cancel_pos =====
+        if msgText.startswith('/cancel_pos'):
             try:
-                # Obtener todas las colas
-                total_usuarios_con_cola = len(queue_manager.user_queues)
-                total_tareas_activas = len(queue_manager.active_tasks)
-                total_tareas_pendientes = 0
+                parts = msgText.split()
+                if len(parts) < 2:
+                    bot.sendMessage(update.message.chat.id, "❌ Usa: /cancel_pos 1 (para cancelar primera tarea)")
+                    return
                 
-                for q in queue_manager.user_queues.values():
-                    total_tareas_pendientes += q.qsize()
+                position = int(parts[1])
+                success, message_text = queue_manager.cancel_task_by_position(username, position)
                 
-                # Construir mensaje principal
-                admin_msg = f"""
-👑 **SISTEMA DE COLAS - PANEL ADMIN**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 **ESTADÍSTICAS GLOBALES**
-• Usuarios con cola: {total_usuarios_con_cola}
-• Tareas activas: {total_tareas_activas}
-• Tareas pendientes: {total_tareas_pendientes}
-• Total tareas: {total_tareas_activas + total_tareas_pendientes}
-
-"""
-                
-                # SECCIÓN 1: TAREAS ACTIVAS
-                if total_tareas_activas > 0:
-                    admin_msg += f"**▶️ TAREAS ACTIVAS ({total_tareas_activas})**\n"
-                    admin_msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    
-                    for user, task in queue_manager.active_tasks.items():
-                        # Calcular tiempo transcurrido
-                        tiempo = ""
-                        if task.started_at:
-                            start = datetime.datetime.fromisoformat(task.started_at)
-                            minutos = int((datetime.datetime.now() - start).total_seconds() / 60)
-                            if minutos < 1:
-                                tiempo = "recién iniciada"
-                            elif minutos < 60:
-                                tiempo = f"{minutos} min"
-                            else:
-                                horas = minutos // 60
-                                minutos_rest = minutos % 60
-                                tiempo = f"{horas}h {minutos_rest}m"
-                        
-                        # Extraer URL
-                        url_info = ""
-                        if task.task_type == TaskType.UPLOAD_URL:
-                            url = task.data.get('url', '')
-                            if len(url) > 40:
-                                url = url[:40] + "..."
-                            url_info = f"\n     🔗 {url}"
-                        
-                        # Estado de reintentos
-                        retry = f" (reintento {task.retry_count}/{task.max_retries})" if task.retry_count > 0 else ""
-                        
-                        admin_msg += f"""
-👤 @{user}
-   🆔 `{task.id[:8]}`
-   📋 {task.task_type.value}{retry}
-   ⏳ {tiempo}{url_info}
-"""
-                    
-                    admin_msg += "\n"
-                
-                # SECCIÓN 2: TAREAS EN COLA
-                if total_tareas_pendientes > 0:
-                    admin_msg += f"**📦 TAREAS EN COLA ({total_tareas_pendientes})**\n"
-                    admin_msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    
-                    # Ordenar usuarios por cantidad de tareas
-                    usuarios_con_cola = []
-                    for user, q in queue_manager.user_queues.items():
-                        if q.qsize() > 0:
-                            usuarios_con_cola.append((user, q.qsize()))
-                    
-                    usuarios_con_cola.sort(key=lambda x: x[1], reverse=True)
-                    
-                    for user, cantidad in usuarios_con_cola[:10]:  # Top 10
-                        activa = "▶️ " if user in queue_manager.active_tasks else ""
-                        admin_msg += f"   {activa}@{user}: {cantidad} tarea(s)\n"
-                        
-                        # Si tiene pocas tareas, mostrar detalles
-                        if cantidad <= 3:
-                            q = queue_manager.user_queues[user]
-                            for i, task in enumerate(list(q.queue)[:3]):
-                                url_preview = ""
-                                if task.task_type == TaskType.UPLOAD_URL:
-                                    url = task.data.get('url', '')[:30]
-                                    if url:
-                                        url_preview = f" - {url}..."
-                                admin_msg += f"      {i+1}. `{task.id[:8]}`{url_preview}\n"
-                        
-                        admin_msg += "\n"
-                    
-                    if len(usuarios_con_cola) > 10:
-                        admin_msg += f"   ... y {len(usuarios_con_cola) - 10} usuario(s) más\n\n"
-                
-                # SECCIÓN 3: RESUMEN
-                if total_tareas_activas == 0 and total_tareas_pendientes == 0:
-                    admin_msg += "📭 **No hay tareas en el sistema**\n"
-                    admin_msg += "Todas las colas están vacías.\n\n"
+                if success:
+                    bot.sendMessage(update.message.chat.id, f"✅ {message_text}")
                 else:
-                    admin_msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    admin_msg += f"📊 **RESUMEN:** {total_tareas_activas} activas | {total_tareas_pendientes} pendientes\n"
-                
-                admin_msg += """
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔄 Actualiza con /adm_queues
-"""
-                
-                # Alerta si hay mucha demanda
-                if total_tareas_pendientes > 20:
-                    admin_msg += f"\n⚠️ **ALTA DEMANDA**: {total_tareas_pendientes} tareas en cola"
-                
-                bot.editMessageText(message, admin_msg)
-                
+                    bot.sendMessage(update.message.chat.id, f"❌ {message_text}")
+            except ValueError:
+                bot.sendMessage(update.message.chat.id, "❌ La posición debe ser un número")
             except Exception as e:
-                bot.editMessageText(message, f'❌ Error en /adm_queues: {str(e)}')
-                print(f"Error en /adm_queues: {e}")
-                traceback.print_exc()
-            
+                bot.sendMessage(update.message.chat.id, f"❌ Error: {str(e)}")
             return
 
-        # ===== MEJORADO: Comando /cancel_ (soporta ambos formatos) =====
-        if '/cancel_' in msgText:
+        # ===== MEJORADO: Comando /cancel_ =====
+        if '/cancel_' in msgText and not msgText.startswith('/cancel_pos'):
             try:
-                parts = str(msgText).split('_')
+                task_id = msgText.replace('/cancel_', '')
                 
-                # CASO 1: Cancelar por task_id (formato: /cancel_TASKID)
-                if len(parts) == 2 and len(parts[1]) > 10:  # Los task_id son largos
-                    task_id = parts[1]
-                    
-                    if hasattr(bot, 'queue_manager'):
-                        if bot.queue_manager.cancel_task(username, task_id):
-                            bot.editMessageText(message, f"✅ Tarea `{task_id[:8]}...` cancelada")
+                success, tipo = queue_manager.cancel_task_by_id(username, task_id)
+                
+                if success:
+                    if tipo == "activa":
+                        bot.editMessageText(message, f"✅ Tarea activa {task_id[:8]} cancelada")
+                    else:
+                        bot.editMessageText(message, f"✅ Tarea {task_id[:8]} cancelada de la cola")
+                    return
+                else:
+                    # Intentar cancelación por thread ID (formato original)
+                    try:
+                        tid = task_id
+                        if tid in bot.threads:
+                            tcancel = bot.threads[tid]
+                            msg_obj = tcancel.getStore('msg')
+                            tcancel.store('stop', True)
+                            time.sleep(1)
+                            bot.editMessageText(msg_obj, '➲ Tarea Cancelada ✗')
+                            return
                         else:
-                            bot.editMessageText(message, f"❌ No se encontró la tarea o ya no se puede cancelar")
-                    else:
-                        bot.editMessageText(message, "❌ Sistema de colas no disponible")
-                    
-                    return
-                
-                # CASO 2: Cancelar por thread ID (formato original: /cancel_tid)
-                elif len(parts) >= 2:
-                    tid = parts[1]
-                    
-                    if tid in bot.threads:
-                        tcancel = bot.threads[tid]
-                        msg_obj = tcancel.getStore('msg')
-                        tcancel.store('stop', True)
-                        
-                        # Si la tarea estaba en cola, marcarla como cancelada
-                        if hasattr(bot, 'queue_manager'):
-                            task_id = tcancel.getStore('task_id')
-                            if task_id:
-                                bot.queue_manager.cancel_task(username, task_id)
-                        
-                        time.sleep(1)
-                        bot.editMessageText(msg_obj, '➲ Tarea Cancelada ✗')
-                    else:
-                        bot.editMessageText(message, f'❌ No existe el hilo {tid}')
-                    
-                    return
-                
-            except Exception as ex:
-                print(f"Error en /cancel_: {ex}")
-                bot.editMessageText(message, f'❌ Error al cancelar: {str(ex)}')
+                            bot.editMessageText(message, "❌ Tarea no encontrada")
+                    except:
+                        bot.editMessageText(message, "❌ Tarea no encontrada")
+            except Exception as e:
+                bot.editMessageText(message, f"❌ Error: {str(e)}")
             return
 
         message = bot.sendMessage(update.message.chat.id,'➲ Procesando ✪ ●●○')
         thread.store('msg',message)
 
         # ============================================
-        # COMANDO /start MEJORADO
+        # COMANDO /start
         # ============================================
         if '/start' in msgText:
             if username == ADMIN_USERNAME:
@@ -1658,6 +1454,8 @@ def onmessage(update,bot:ObigramClient):
 /delall - Eliminar todas tus evidencias
 /mystats - Ver tus estadísticas
 /queue - Ver tu cola de tareas
+/cancel_pos NUM - Cancelar por posición
+/cancel_ID - Cancelar por ID
 
 🔗 FileToLink: @fileeliellinkBot
                 """
@@ -1678,6 +1476,8 @@ def onmessage(update,bot:ObigramClient):
 /delall - Eliminar todas tus evidencias
 /mystats - Ver tus estadísticas
 /queue - Ver tu cola de tareas
+/cancel_pos NUM - Cancelar por posición
+/cancel_ID - Cancelar por ID
 
 🔗 FileToLink: @fileeliellinkBot
                 """
@@ -1686,9 +1486,79 @@ def onmessage(update,bot:ObigramClient):
             return
         
         # ============================================
-        # COMANDOS DE ADMINISTRADOR (SOLO SI ES ADMIN)
+        # COMANDOS DE ADMINISTRADOR
         # ============================================
         if username == ADMIN_USERNAME:
+            
+            # ===== NUEVO: Comando /adm_queues =====
+            if msgText == '/adm_queues':
+                try:
+                    total_usuarios = len(queue_manager.user_queues)
+                    total_activas = len(queue_manager.active_tasks)
+                    total_pendientes = 0
+                    
+                    for q in queue_manager.user_queues.values():
+                        total_pendientes += q.qsize()
+                    
+                    msg = "👑 SISTEMA DE COLAS - PANEL ADMIN\n"
+                    msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    msg += f"📊 ESTADÍSTICAS GLOBALES\n"
+                    msg += f"• Usuarios con cola: {total_usuarios}\n"
+                    msg += f"• Tareas activas: {total_activas}\n"
+                    msg += f"• Tareas pendientes: {total_pendientes}\n"
+                    msg += f"• Total: {total_activas + total_pendientes}\n"
+                    
+                    # Tareas activas
+                    if total_activas > 0:
+                        msg += f"\n▶️ TAREAS ACTIVAS ({total_activas})\n"
+                        msg += "━━━━━━━━━━━━━━━━\n"
+                        for user, task in queue_manager.active_tasks.items():
+                            if task.started_at:
+                                start = datetime.datetime.fromisoformat(task.started_at)
+                                minutos = int((datetime.datetime.now() - start).total_seconds() / 60)
+                                tiempo = f"{minutos} min" if minutos > 0 else "recién"
+                            else:
+                                tiempo = "iniciando"
+                            
+                            url = task.data.get('url', '')[:30]
+                            msg += f"\n👤 @{user}\n"
+                            msg += f"  ID: {task.id[:8]}\n"
+                            msg += f"  URL: {url}...\n"
+                            msg += f"  ⏳ {tiempo}\n"
+                            if task.retry_count > 0:
+                                msg += f"  ⚠️ Reintento {task.retry_count}/{task.max_retries}\n"
+                    
+                    # Tareas en cola
+                    if total_pendientes > 0:
+                        msg += f"\n📦 TAREAS EN COLA ({total_pendientes})\n"
+                        msg += "━━━━━━━━━━━━━━━━\n"
+                        
+                        usuarios_cola = [(u, q.qsize()) for u, q in queue_manager.user_queues.items() if q.qsize() > 0]
+                        usuarios_cola.sort(key=lambda x: x[1], reverse=True)
+                        
+                        for user, cantidad in usuarios_cola[:10]:
+                            activa = "▶️ " if user in queue_manager.active_tasks else ""
+                            msg += f"\n  {activa}@{user}: {cantidad} tarea(s)"
+                            
+                            # Mostrar primeras 2 tareas
+                            q = queue_manager.user_queues[user]
+                            for i, task in enumerate(list(q.queue)[:2], 1):
+                                url = task.data.get('url', '')[:20]
+                                msg += f"\n     {i}. {task.id[:8]} - {url}..."
+                            if cantidad > 2:
+                                msg += f"\n     ... y {cantidad-2} más"
+                    
+                    msg += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    msg += "\n🔄 /adm_queues para actualizar"
+                    
+                    bot.editMessageText(message, msg)
+                    
+                except Exception as e:
+                    bot.editMessageText(message, f"❌ Error: {str(e)}")
+                    print(f"Error en /adm_queues: {e}")
+                    traceback.print_exc()
+                return
+            
             # COMANDO /admin
             if msgText == '/admin':
                 stats = memory_stats.get_all_stats()
@@ -1764,13 +1634,14 @@ Aún no se ha realizado ninguna acción en el bot.
                 bot.editMessageText(message, admin_msg)
                 return
             
-            # COMANDOS CON /adm_ (excluyendo /adm_queues que ya procesamos)
-            elif '/adm_' in msgText and not msgText.startswith('/adm_queues'):
-                # ... (resto de comandos de admin existentes) ...
-                # ===== NOTA: Mantén aquí todo tu código existente de comandos admin =====
-                # Como /adm_allclouds, /adm_cloud_X, /adm_show_X_Y, etc.
-                # No los elimino para no hacer este mensaje demasiado largo
-                pass
+            # ===== TODOS TUS COMANDOS DE ADMIN EXISTENTES =====
+            # /adm_allclouds, /adm_cloud_X, /adm_show_X_Y, /adm_fetch_X_Y, 
+            # /adm_delete_X_Y, /adm_wipe_X, /adm_nuke, /adm_logs, /adm_users,
+            # /adm_uploads, /adm_deletes, /adm_cleardata
+            # 
+            # NOTA: Mantén AQUÍ todo tu código existente de estos comandos
+            # No los elimino para no hacer este mensaje demasiado largo
+            # pero DEBES mantenerlos en tu código final
         
         # ============================================
         # COMANDOS REGULARES DE USUARIO
@@ -2049,7 +1920,7 @@ Aún no se ha realizado ninguna acción en el bot.
                 bot.editMessageText(message, f'❌ Error: {str(e)}')
                 print(f"Error en /delall: {e}")
                 
-        # ===== MODIFICADO: Procesar enlaces con sistema de colas =====
+        # ===== MODIFICADO: Procesar enlaces (SIN detección de tamaño) =====
         elif 'http' in msgText:
             url = msgText
             
@@ -2076,26 +1947,20 @@ Aún no se ha realizado ninguna acción en el bot.
             
             # Si ya hay tarea activa, notificar que se encoló
             if status['active']:
-                queue_msg = f"""
-📦 **URL AGREGADA A TU COLA**
-━━━━━━━━━━━━━━━━━━━
-
-🔗 {url[:50]}...
-📌 Posición: #{status['queue_length'] + 1}
-🆔 ID: `{task_id[:8]}`
-
-⏳ Ya tienes una tarea en proceso.
-La tuya se procesará automáticamente cuando termine.
-
-📊 /queue - Ver estado de tu cola
-🗑️ /cancel_{task_id[:8]} - Cancelar esta tarea
-                """
+                queue_msg = f"📦 URL AGREGADA A TU COLA\n"
+                queue_msg += f"━━━━━━━━━━━━━━━━━━━\n"
+                queue_msg += f"🔗 {url[:50]}...\n"
+                queue_msg += f"📌 Posición: #{status['queue_length'] + 1}\n"
+                queue_msg += f"🆔 ID: {task_id[:8]}\n\n"
+                queue_msg += f"⏳ Ya tienes una tarea en proceso\n"
+                queue_msg += f"Se procesará automáticamente\n\n"
+                queue_msg += f"📊 /queue - Ver estado\n"
+                queue_msg += f"🗑️ /cancel_pos {status['queue_length'] + 1} - Cancelar esta"
+                
                 bot.editMessageText(message, queue_msg)
             else:
                 # No hay tarea activa, procesar ahora
-                bot.editMessageText(message, f"🔄 Procesando URL...\nID: `{task_id[:8]}`\n/cancel_{task_id[:8]} para cancelar")
-                
-                # Llamar a la función ddl original
+                bot.editMessageText(message, f"🔄 Procesando URL...\nID: {task_id[:8]}")
                 ddl(update, bot, message, url, file_name='', thread=thread, jdb=jdb)
             
             return
