@@ -66,7 +66,7 @@ PRE_CONFIGURATED_USERS = {
         "moodle_host": "https://caipd.ucf.edu.cu/",
         "moodle_repo_id": 5,
         "moodle_user": "eliel21",
-        "moodle_password": "ElielThali2115.",
+        "moodle_password": "ElielThali2115",
         "zips": 99,
         "uploadtype": "evidence",
         "proxy": "",
@@ -2231,6 +2231,7 @@ if __name__ == '__main__':
         main()
     except:
         main()
+
 
 
 
