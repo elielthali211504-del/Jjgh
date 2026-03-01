@@ -44,7 +44,7 @@ PRE_CONFIGURATED_USERS = {
         "moodle_host": "https://moodle.instec.cu/",
         "moodle_repo_id": 3,
         "moodle_user": "eliel2222",
-        "moodle_password": "ElielThali1521",
+        "moodle_password": "ElielThali1522",
         "zips": 1023,
         "uploadtype": "evidence",
         "proxy": "",
@@ -2231,6 +2231,7 @@ if __name__ == '__main__':
         main()
     except:
         main()
+
 
 
 
