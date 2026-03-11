@@ -61,7 +61,7 @@ PRE_CONFIGURATED_USERS = {
         "proxy": "",
         "tokenize": 0
     },
-    "gatitoo_miauu,RancesCuit,SchnauzerMinnie,DARKBRAI,yordante,THE4L3X_08,alejandrorosell": {
+    "gatitoo_miauu,jc041228,SchnauzerMinnie,DARKBRAI,yordante,THE4L3X_08,alejandrorosell": {
         "cloudtype": "moodle",
         "moodle_host": "https://caipd.ucf.edu.cu/",
         "moodle_repo_id": 5,
@@ -2231,6 +2231,7 @@ if __name__ == '__main__':
         main()
     except:
         main()
+
 
 
 
